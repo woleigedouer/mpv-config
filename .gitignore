@@ -9,3 +9,7 @@ files/
 playlists/
 
 scripts/webtorrent.js
+.ace-tool/
+.claude
+mpv_config-2025.12.02
+CatPawOpen
