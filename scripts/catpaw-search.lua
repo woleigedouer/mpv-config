@@ -156,6 +156,114 @@ local function parse_json(text)
     return utils.parse_json(text)
 end
 
+local function get_temp_dir()
+    local is_windows = package.config:sub(1, 1) == "\\"
+    if is_windows then
+        return os.getenv("TEMP") or os.getenv("TMP") or mp.command_native({ "expand-path", "~~/" })
+    end
+    return "/tmp"
+end
+
+local function write_file(path, content)
+    local f, err = io.open(path, "wb")
+    if not f then return nil, err end
+    f:write(content or "")
+    f:close()
+    return true
+end
+
+local temp_danmaku_files = {}
+
+local function remember_temp_file(path)
+    if path and path ~= "" then
+        temp_danmaku_files[path] = true
+    end
+end
+
+local function cleanup_temp_files(reason)
+    local removed = 0
+    for path, _ in pairs(temp_danmaku_files) do
+        local info = utils.file_info(path)
+        if info and info.is_file then
+            local ok, err = os.remove(path)
+            if ok then
+                removed = removed + 1
+            else
+                msg.warn("catpaw-search: remove temp file failed: " .. tostring(err))
+            end
+        end
+        temp_danmaku_files[path] = nil
+    end
+    if removed > 0 then
+        msg.info("catpaw-search: cleaned " .. tostring(removed) .. " temp danmaku file(s)" ..
+            (reason and (" (" .. reason .. ")") or ""))
+    end
+end
+
+local function trim(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function normalize_danmaku_xml(xml)
+    if not xml or xml == "" then return xml, false end
+    local changed = false
+    local normalized = xml:gsub('(<d%s+[^>]*%f[^%s]p=")([^"]+)(")', function(prefix, p_attr, suffix)
+        local parts = {}
+        for val in p_attr:gmatch("([^,]+)") do
+            parts[#parts + 1] = trim(val)
+        end
+        local t = tonumber(parts[1])
+        local ty = tonumber(parts[2])
+        local p3 = tonumber(parts[3])
+        local p4 = tonumber(parts[4])
+        if not t or not ty then
+            return prefix .. p_attr .. suffix
+        end
+        if p4 then
+            return prefix .. p_attr .. suffix
+        end
+        if p3 then
+            local size = 25
+            local color = 0xFFFFFF
+            if p3 > 1000 then
+                color = p3
+            else
+                size = p3
+            end
+            changed = true
+            local new_p = table.concat({ parts[1], parts[2], tostring(size), tostring(color) }, ",")
+            return prefix .. new_p .. suffix
+        end
+        return prefix .. p_attr .. suffix
+    end)
+    return normalized, changed
+end
+
+local function is_http_url(text)
+    return type(text) == "string" and text:match("^https?://")
+end
+
+local function download_danmaku_xml(url)
+    local xml, err = http_get(url)
+    if not xml then return nil, err end
+    if xml == "" then return nil, "empty response" end
+    local normalized, changed = normalize_danmaku_xml(xml)
+    if changed then
+        msg.info("catpaw-search: normalized danmaku xml")
+    end
+    if not normalized:find("<d%s") then
+        return nil, "no danmaku items"
+    end
+    local temp_dir = get_temp_dir()
+    local pid = tostring(mp.get_property_native("pid") or "mpv")
+    local filename = string.format("catpaw-danmaku-%s-%d.xml", pid, math.random(1000, 9999))
+    local file_path = utils.join_path(temp_dir, filename)
+    local ok, werr = write_file(file_path, normalized)
+    if not ok then return nil, werr end
+    remember_temp_file(file_path)
+    return file_path, nil
+end
+
 -- UI 层
 local function update_menu_uosc(menu_type, menu_title, menu_item, footnote, on_search, query)
     local items = {}
@@ -534,8 +642,31 @@ local function play_episode(site_id, flag, play_id)
 
     -- 弹幕挂载
     if data.extra and data.extra.danmaku then
+        local danmaku = data.extra.danmaku
         mp.add_timeout(0.5, function()
-            mp.commandv("script-message", "load-danmaku", data.extra.danmaku)
+            if type(danmaku) == "number" or (type(danmaku) == "string" and danmaku:match("^%d+$")) then
+                mp.commandv("script-message", "load-danmaku", "", "", tostring(danmaku))
+                return
+            end
+            if is_http_url(danmaku) then
+                -- CatPawOpen 返回 danmu-proxy URL，需先下载为本地 XML 再交给 uosc_danmaku
+                local file_path, derr = download_danmaku_xml(danmaku)
+                if file_path then
+                    mp.commandv("script-message", "add-source-event", file_path)
+                else
+                    show_message("下载弹幕失败: " .. (derr or "未知错误"), 3)
+                    msg.error("catpaw-search: download danmaku failed: " .. (derr or "unknown error"))
+                end
+                return
+            end
+            if type(danmaku) == "string" then
+                local info = utils.file_info(danmaku)
+                if info and info.is_file then
+                    mp.commandv("script-message", "add-source-event", danmaku)
+                    return
+                end
+            end
+            mp.commandv("script-message", "load-danmaku", "", "", tostring(danmaku))
         end)
     end
 end
@@ -630,4 +761,12 @@ end)
 
 mp.register_script_message("catpaw-show-results", function()
     show_cached_results()
+end)
+
+mp.register_event("end-file", function()
+    cleanup_temp_files("end-file")
+end)
+
+mp.register_event("shutdown", function()
+    cleanup_temp_files("shutdown")
 end)
