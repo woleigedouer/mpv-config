@@ -69,6 +69,8 @@ local function split(str, sep)
 end
 
 -- HTTP 请求
+local CURL_NOT_FOUND = "curl 未安装或不在 PATH 中"
+
 local function build_curl_args(method, url, body)
     local args = {
         "curl", "-s", "-L",
@@ -88,6 +90,17 @@ local function build_curl_args(method, url, body)
     return args
 end
 
+local function is_curl_missing(res)
+    if not res then return false end
+    if res.status == -2 or res.status == -3 then return true end
+    local err_str = res.error_string or res.stderr or ""
+    if err_str:lower():find("not found") then return true end
+    if err_str:lower():find("createprocess") then return true end
+    if err_str:lower():find("no such file") then return true end
+    if err_str:lower():find("cannot find") then return true end
+    return false
+end
+
 local function http_get(url)
     local res = mp.command_native({
         name = "subprocess",
@@ -96,7 +109,10 @@ local function http_get(url)
         playback_only = false,
         args = build_curl_args("GET", url, nil),
     })
-    if res.status ~= 0 then return nil, res.stderr end
+    if res.status ~= 0 then
+        if is_curl_missing(res) then return nil, CURL_NOT_FOUND end
+        return nil, res.stderr or res.error_string
+    end
     return res.stdout, nil
 end
 
@@ -108,7 +124,10 @@ local function http_post(url, body)
         playback_only = false,
         args = build_curl_args("POST", url, body),
     })
-    if res.status ~= 0 then return nil, res.stderr end
+    if res.status ~= 0 then
+        if is_curl_missing(res) then return nil, CURL_NOT_FOUND end
+        return nil, res.stderr or res.error_string
+    end
     return res.stdout, nil
 end
 
@@ -121,7 +140,11 @@ local function http_post_async(url, body, cb)
         args = build_curl_args("POST", url, body),
     }, function(success, result)
         if not success or not result or result.status ~= 0 then
-            cb(nil, result and result.stderr or "request failed")
+            if is_curl_missing(result) then
+                cb(nil, CURL_NOT_FOUND)
+            else
+                cb(nil, result and (result.stderr or result.error_string) or "request failed")
+            end
             return
         end
         cb(result.stdout, nil)
@@ -172,7 +195,9 @@ local function open_menu_select(menu_items, prompt)
         prompt = prompt or "选择:",
         items = item_titles,
         submit = function(id)
-            mp.commandv(unpack(item_values[id]))
+            if id and item_values[id] then
+                mp.commandv(unpack(item_values[id]))
+            end
         end,
     })
 end
@@ -242,30 +267,40 @@ local function search_all_sites(keyword, done)
     end
 
     local pending = #sites
-    local results = {}
+    local results_by_site = {}
     local errors = {}
 
-    for _, site in ipairs(sites) do
+    for idx, site in ipairs(sites) do
         local url = join_url(site.api .. "/search")
         local body = utils.format_json({ wd = keyword, page = 1 })
         http_post_async(url, body, function(out, err_msg)
             if out then
                 local data = parse_json(out)
                 if data and type(data.list) == "table" then
+                    local site_results = {}
                     local count = 0
                     for _, vod in ipairs(data.list) do
-                        results[#results + 1] = { site = site, vod = vod }
+                        site_results[#site_results + 1] = { site = site, vod = vod }
                         count = count + 1
                         if o.max_results_per_site > 0 and count >= o.max_results_per_site then
                             break
                         end
                     end
+                    results_by_site[idx] = site_results
                 end
             else
                 errors[#errors + 1] = (site.name or site.id) .. ": " .. (err_msg or "请求失败")
             end
             pending = pending - 1
             if pending == 0 then
+                local results = {}
+                for i = 1, #sites do
+                    if results_by_site[i] then
+                        for _, entry in ipairs(results_by_site[i]) do
+                            results[#results + 1] = entry
+                        end
+                    end
+                end
                 done(results, #errors > 0 and errors or nil)
             end
         end)
@@ -515,7 +550,11 @@ local function do_search(keyword)
 
     local ok, err = check_service()
     if ok ~= true then
-        show_message("CatPawOpen 服务未运行", 3)
+        if err == CURL_NOT_FOUND then
+            show_message(CURL_NOT_FOUND, 3)
+        else
+            show_message("CatPawOpen 服务未运行", 3)
+        end
         if err then msg.error("catpaw-search: /check failed: " .. err) end
         return
     end
