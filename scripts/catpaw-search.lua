@@ -34,6 +34,10 @@ local state = {
     last_play_headers = nil,
     saved_http_headers = nil,
     http_headers_applied = false,
+    episode_cache = nil,
+    episode_cache_key = nil,
+    last_episode_ctx = nil,
+    last_variant_title = nil,
 }
 
 local detail_cache = {}
@@ -74,6 +78,64 @@ local function split(str, sep)
         start = j + 1
     end
     return res
+end
+
+local function build_episode_cache(vod)
+    local cache = { lines = {}, line_map = {} }
+    if not vod then return cache end
+    local lines = split(vod.vod_play_from or "", "$$$")
+    local groups = split(vod.vod_play_url or "", "$$$")
+    for i, group in ipairs(groups) do
+        local line = lines[i] or ("线路 " .. tostring(i))
+        local episodes = {}
+        local ep_count = 0
+        for ep in group:gmatch("[^#]+") do
+            if ep ~= "" then
+                local name, id = ep:match("^(.-)%$(.+)$")
+                name = name or ep
+                id = id or ep
+                ep_count = ep_count + 1
+                episodes[#episodes + 1] = {
+                    title = name,
+                    id = id,
+                    line = line,
+                    index = ep_count,
+                }
+            end
+        end
+        if ep_count > 0 then
+            local entry = {
+                line = line,
+                index = #cache.lines + 1,
+                episodes = episodes,
+            }
+            cache.lines[#cache.lines + 1] = entry
+            cache.line_map[line] = entry
+        end
+    end
+    return cache
+end
+
+local function set_episode_cache(site_id, vod_id, vod)
+    if not site_id or not vod_id then return nil end
+    local cache = build_episode_cache(vod)
+    state.episode_cache = cache
+    state.episode_cache_key = site_id .. ":" .. tostring(vod_id)
+    return cache
+end
+
+local function get_episode_cache(site_id, vod_id)
+    if not site_id or not vod_id then return nil end
+    local key = site_id .. ":" .. tostring(vod_id)
+    if state.episode_cache and state.episode_cache_key == key then
+        return state.episode_cache
+    end
+    local detail = detail_cache[key]
+    local vod = detail and detail.list and detail.list[1]
+    if vod then
+        return set_episode_cache(site_id, vod_id, vod)
+    end
+    return nil
 end
 
 -- HTTP 请求
@@ -272,6 +334,11 @@ end
 
 local function is_http_url(text)
     return type(text) == "string" and text:match("^https?://")
+end
+
+local function is_catpaw_playback()
+    local path = mp.get_property("path") or ""
+    return path ~= "" and path:sub(1, #base_url) == base_url
 end
 
 local function normalize_http_headers(headers)
@@ -684,6 +751,7 @@ local function play_variant(index)
         show_message("无可用播放地址", 2)
         return
     end
+    state.last_variant_title = variants[idx].title
     apply_http_headers(state.last_play_headers)
     state.pending_danmaku = state.last_play_danmaku
     state.pending_attach = true
@@ -764,6 +832,121 @@ local function show_search_results(results, errors)
     end
 end
 
+local function build_episode_menu_items(cache, site_id)
+    local items = {}
+    if not cache or not cache.lines then return items end
+    for _, entry in ipairs(cache.lines) do
+        local episodes = {}
+        for _, ep in ipairs(entry.episodes) do
+            episodes[#episodes + 1] = {
+                title = ep.title,
+                value = {
+                    "script-message-to", mp.get_script_name(), "catpaw-play-episode",
+                    site_id, entry.line, ep.id,
+                },
+            }
+        end
+        if #episodes > 0 then
+            items[#items + 1] = {
+                title = entry.line,
+                hint = #episodes .. " 集",
+                items = episodes,
+            }
+        end
+    end
+    return items
+end
+
+local function build_episode_flat_items(cache, site_id)
+    local items = {}
+    if not cache or not cache.lines then return items end
+    for _, entry in ipairs(cache.lines) do
+        for _, ep in ipairs(entry.episodes) do
+            items[#items + 1] = {
+                title = ep.title,
+                hint = entry.line,
+                value = {
+                    "script-message-to", mp.get_script_name(), "catpaw-play-episode",
+                    site_id, entry.line, ep.id,
+                },
+            }
+        end
+    end
+    return items
+end
+
+local function show_episode_list()
+    local detail = state.current_detail
+    if not detail or not detail.site or not detail.vod_id then
+        show_message("暂无剧集列表", 2)
+        return
+    end
+    local cache = get_episode_cache(detail.site.id, detail.vod_id)
+    if not cache or not cache.lines or #cache.lines == 0 then
+        show_message("暂无剧集列表", 2)
+        return
+    end
+    local title = (detail.vod and detail.vod.vod_name) or "剧集列表"
+    if use_uosc() then
+        local items = build_episode_menu_items(cache, detail.site.id)
+        update_menu_uosc("catpaw_detail", title, items, "", nil, nil)
+    elseif input_loaded then
+        local items = build_episode_flat_items(cache, detail.site.id)
+        mp.osd_message("")
+        mp.add_timeout(0.1, function() open_menu_select(items, "选择剧集") end)
+    else
+        show_message("需要 uosc 或 mp.input 支持", 3)
+    end
+end
+
+local function update_last_episode_ctx(site_id, line, play_id)
+    if not site_id or not line or not play_id then return end
+    local vod_id = state.current_detail and state.current_detail.vod_id
+    local cache = vod_id and get_episode_cache(site_id, vod_id) or state.episode_cache
+    if not cache or not cache.line_map then return end
+    local entry = cache.line_map[line]
+    if not entry then
+        for _, e in ipairs(cache.lines or {}) do
+            if trim(e.line) == trim(line) then
+                entry = e
+                break
+            end
+        end
+    end
+    if not entry then return end
+    local ep_index = nil
+    for i, ep in ipairs(entry.episodes) do
+        if tostring(ep.id) == tostring(play_id) then
+            ep_index = i
+            break
+        end
+    end
+    state.last_episode_ctx = {
+        site_id = site_id,
+        line = entry.line,
+        line_index = entry.index,
+        episode_index = ep_index or 0,
+        play_id = play_id,
+    }
+end
+
+local function get_next_episode_ctx()
+    local ctx = state.last_episode_ctx
+    if not ctx or not ctx.site_id then return nil end
+    local cache = state.episode_cache
+    if not cache or not cache.line_map then return nil end
+    local entry = cache.line_map[ctx.line]
+    if not entry then return nil end
+    local next_index = (ctx.episode_index or 0) + 1
+    local next_ep = entry.episodes[next_index]
+    if not next_ep then return nil end
+    return {
+        site_id = ctx.site_id,
+        line = entry.line,
+        play_id = next_ep.id,
+    }
+end
+
 local function show_detail(site_id, vod_id)
     local site = state.sites_by_id[site_id]
     if not site then
@@ -785,66 +968,14 @@ local function show_detail(site_id, vod_id)
 
     state.current_detail = { site = site, vod = vod, vod_id = vod_id }
 
-    local lines = split(vod.vod_play_from or "", "$$$")
-    local groups = split(vod.vod_play_url or "", "$$$")
+    local cache = set_episode_cache(site.id, vod_id, vod)
     local title = vod.vod_name or "详情"
 
     if use_uosc() then
-        -- 按线路分组，使用子菜单展示
-        local items = {}
-
-        for i, group in ipairs(groups) do
-            local line = lines[i] or ("线路 " .. tostring(i))
-            local episodes = {}
-            local ep_count = 0
-
-            for ep in group:gmatch("[^#]+") do
-                if ep ~= "" then
-                    local name, id = ep:match("^(.-)%$(.+)$")
-                    name = name or ep
-                    id = id or ep
-                    ep_count = ep_count + 1
-                    episodes[#episodes + 1] = {
-                        title = name,
-                        value = {
-                            "script-message-to", mp.get_script_name(), "catpaw-play-episode",
-                            site.id, line, id,
-                        },
-                    }
-                end
-            end
-
-            if ep_count > 0 then
-                items[#items + 1] = {
-                    title = line,
-                    hint = ep_count .. " 集",
-                    items = episodes,
-                }
-            end
-        end
-
+        local items = build_episode_menu_items(cache, site.id)
         update_menu_uosc("catpaw_detail", title, items, "", nil, nil)
     elseif input_loaded then
-        -- mp.input 不支持子菜单，使用扁平列表
-        local items = {}
-        for i, group in ipairs(groups) do
-            local line = lines[i] or ("线路 " .. tostring(i))
-            for ep in group:gmatch("[^#]+") do
-                if ep ~= "" then
-                    local name, id = ep:match("^(.-)%$(.+)$")
-                    name = name or ep
-                    id = id or ep
-                    items[#items + 1] = {
-                        title = name,
-                        hint = line,
-                        value = {
-                            "script-message-to", mp.get_script_name(), "catpaw-play-episode",
-                            site.id, line, id,
-                        },
-                    }
-                end
-            end
-        end
+        local items = build_episode_flat_items(cache, site.id)
         mp.osd_message("")
         mp.add_timeout(0.1, function() open_menu_select(items, "选择剧集") end)
     else
@@ -870,8 +1001,30 @@ local function play_episode(site_id, flag, play_id)
     state.last_play_variants = variants
     state.last_play_danmaku = data.extra and data.extra.danmaku or nil
     state.last_play_headers = data.header
+    update_last_episode_ctx(site_id, flag, play_id)
 
-    local url = extract_play_url(data, variants)
+    local url = nil
+    if variants and #variants > 0 then
+        local chosen_index = nil
+        if state.last_variant_title then
+            for i, v in ipairs(variants) do
+                if v.title == state.last_variant_title then
+                    chosen_index = i
+                    break
+                end
+            end
+        end
+        if not chosen_index then
+            chosen_index = 1
+        end
+        local chosen = variants[chosen_index]
+        url = chosen and chosen.url or nil
+        if chosen and chosen.title then
+            state.last_variant_title = chosen.title
+        end
+    else
+        url = extract_play_url(data, variants)
+    end
     if not url or url == "" then
         show_message("无可用播放地址", 3)
         return
@@ -976,6 +1129,10 @@ mp.register_script_message("catpaw-show-streams", function()
     show_play_variants()
 end)
 
+mp.register_script_message("catpaw-show-episodes", function()
+    show_episode_list()
+end)
+
 mp.register_script_message("catpaw-play-variant", function(index)
     play_variant(index)
 end)
@@ -984,12 +1141,23 @@ mp.register_script_message("catpaw-show-results", function()
     show_cached_results()
 end)
 
-mp.register_event("end-file", function()
+mp.register_event("end-file", function(event)
     cleanup_temp_files("end-file")
+    local reason = event and event.reason or mp.get_property("end-file-reason")
+    if reason == "eof" and not state.switching_stream then
+        local next_ctx = get_next_episode_ctx()
+        if next_ctx then
+            mp.add_timeout(0, function()
+                play_episode(next_ctx.site_id, next_ctx.line, next_ctx.play_id)
+            end)
+            return
+        end
+    end
     if not state.switching_stream then
         state.last_play_variants = nil
         state.last_play_danmaku = nil
         state.last_play_headers = nil
+        state.last_variant_title = nil
         state.pending_danmaku = nil
         state.pending_attach = false
         restore_http_headers()
@@ -1012,8 +1180,12 @@ mp.register_event("shutdown", function()
     state.last_play_variants = nil
     state.last_play_danmaku = nil
     state.last_play_headers = nil
+    state.last_variant_title = nil
     state.pending_danmaku = nil
     state.pending_attach = false
     state.switching_stream = false
+    state.episode_cache = nil
+    state.episode_cache_key = nil
+    state.last_episode_ctx = nil
     restore_http_headers()
 end)
