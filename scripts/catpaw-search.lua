@@ -80,6 +80,10 @@ local function split(str, sep)
     return res
 end
 
+local function trim(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
 local function build_episode_cache(vod)
     local cache = { lines = {}, line_map = {} }
     if not vod then return cache end
@@ -114,6 +118,19 @@ local function build_episode_cache(vod)
         end
     end
     return cache
+end
+
+local function get_episode_entry(line)
+    local cache = state.episode_cache
+    if not cache or not cache.line_map then return nil end
+    local entry = cache.line_map[line]
+    if entry then return entry end
+    for _, e in ipairs(cache.lines or {}) do
+        if trim(e.line) == trim(line) then
+            return e
+        end
+    end
+    return nil
 end
 
 local function set_episode_cache(site_id, vod_id, vod)
@@ -291,10 +308,6 @@ local function cleanup_temp_files(reason)
         msg.info("catpaw-search: cleaned " .. tostring(removed) .. " temp danmaku file(s)" ..
             (reason and (" (" .. reason .. ")") or ""))
     end
-end
-
-local function trim(s)
-    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 local function normalize_danmaku_xml(xml)
@@ -904,15 +917,7 @@ local function update_last_episode_ctx(site_id, line, play_id)
     local vod_id = state.current_detail and state.current_detail.vod_id
     local cache = vod_id and get_episode_cache(site_id, vod_id) or state.episode_cache
     if not cache or not cache.line_map then return end
-    local entry = cache.line_map[line]
-    if not entry then
-        for _, e in ipairs(cache.lines or {}) do
-            if trim(e.line) == trim(line) then
-                entry = e
-                break
-            end
-        end
-    end
+    local entry = get_episode_entry(line)
     if not entry then return end
     local ep_index = nil
     for i, ep in ipairs(entry.episodes) do
@@ -930,21 +935,61 @@ local function update_last_episode_ctx(site_id, line, play_id)
     }
 end
 
-local function get_next_episode_ctx()
+local function get_episode_ctx_by_offset(offset)
     local ctx = state.last_episode_ctx
-    if not ctx or not ctx.site_id then return nil end
-    local cache = state.episode_cache
-    if not cache or not cache.line_map then return nil end
-    local entry = cache.line_map[ctx.line]
-    if not entry then return nil end
-    local next_index = (ctx.episode_index or 0) + 1
-    local next_ep = entry.episodes[next_index]
-    if not next_ep then return nil end
+    if not ctx or not ctx.site_id then return nil, "暂无剧集信息" end
+    local entry = get_episode_entry(ctx.line)
+    if not entry then return nil, "暂无线路信息" end
+    local base_index = ctx.episode_index or 0
+    if base_index <= 0 then
+        for i, ep in ipairs(entry.episodes) do
+            if tostring(ep.id) == tostring(ctx.play_id) then
+                base_index = i
+                break
+            end
+        end
+    end
+    if base_index <= 0 then return nil, "暂无剧集索引" end
+    local target_index = base_index + offset
+    if target_index < 1 then return nil, "已是第一集" end
+    if target_index > #entry.episodes then return nil, "已是最后一集" end
+    local target_ep = entry.episodes[target_index]
+    if not target_ep then return nil, "无可用剧集" end
     return {
         site_id = ctx.site_id,
         line = entry.line,
-        play_id = next_ep.id,
-    }
+        play_id = target_ep.id,
+    }, nil
+end
+
+local function get_next_episode_ctx()
+    local ctx, _ = get_episode_ctx_by_offset(1)
+    return ctx
+end
+
+local function get_prev_episode_ctx()
+    local ctx, _ = get_episode_ctx_by_offset(-1)
+    return ctx
+end
+
+local play_episode
+
+local function play_next_episode()
+    local ctx, err = get_episode_ctx_by_offset(1)
+    if not ctx then
+        show_message(err or "暂无下一集", 2)
+        return
+    end
+    play_episode(ctx.site_id, ctx.line, ctx.play_id)
+end
+
+local function play_prev_episode()
+    local ctx, err = get_episode_ctx_by_offset(-1)
+    if not ctx then
+        show_message(err or "暂无上一集", 2)
+        return
+    end
+    play_episode(ctx.site_id, ctx.line, ctx.play_id)
 end
 
 local function show_detail(site_id, vod_id)
@@ -983,7 +1028,7 @@ local function show_detail(site_id, vod_id)
     end
 end
 
-local function play_episode(site_id, flag, play_id)
+play_episode = function(site_id, flag, play_id)
     local site = state.sites_by_id[site_id]
     if not site then
         show_message("站点未找到", 3)
@@ -1131,6 +1176,14 @@ end)
 
 mp.register_script_message("catpaw-show-episodes", function()
     show_episode_list()
+end)
+
+mp.register_script_message("catpaw-prev-episode", function()
+    play_prev_episode()
+end)
+
+mp.register_script_message("catpaw-next-episode", function()
+    play_next_episode()
 end)
 
 mp.register_script_message("catpaw-play-variant", function(index)
