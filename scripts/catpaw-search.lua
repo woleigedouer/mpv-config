@@ -26,6 +26,14 @@ local state = {
     last_query = "",
     last_results = nil,
     current_detail = nil,
+    last_play_variants = nil,
+    last_play_danmaku = nil,
+    pending_danmaku = nil,
+    pending_attach = false,
+    switching_stream = false,
+    last_play_headers = nil,
+    saved_http_headers = nil,
+    http_headers_applied = false,
 }
 
 local detail_cache = {}
@@ -173,10 +181,30 @@ local function write_file(path, content)
 end
 
 local temp_danmaku_files = {}
+local temp_danmaku_by_url = {}
 
 local function remember_temp_file(path)
     if path and path ~= "" then
         temp_danmaku_files[path] = true
+    end
+end
+
+local function get_cached_danmaku(url)
+    if not url or url == "" then return nil end
+    local cached = temp_danmaku_by_url[url]
+    if cached and cached ~= "" then
+        local info = utils.file_info(cached)
+        if info and info.is_file then
+            return cached
+        end
+    end
+    temp_danmaku_by_url[url] = nil
+    return nil
+end
+
+local function remember_danmaku_url(url, path)
+    if url and url ~= "" and path and path ~= "" then
+        temp_danmaku_by_url[url] = path
     end
 end
 
@@ -193,6 +221,9 @@ local function cleanup_temp_files(reason)
             end
         end
         temp_danmaku_files[path] = nil
+    end
+    if next(temp_danmaku_by_url) ~= nil then
+        temp_danmaku_by_url = {}
     end
     if removed > 0 then
         msg.info("catpaw-search: cleaned " .. tostring(removed) .. " temp danmaku file(s)" ..
@@ -243,7 +274,51 @@ local function is_http_url(text)
     return type(text) == "string" and text:match("^https?://")
 end
 
+local function normalize_http_headers(headers)
+    local fields = {}
+    if type(headers) ~= "table" then return fields end
+    for k, v in pairs(headers) do
+        if type(k) == "string" and v ~= nil then
+            local value = tostring(v)
+            if value ~= "" then
+                fields[#fields + 1] = k .. ": " .. value
+            end
+        end
+    end
+    return fields
+end
+
+local function apply_http_headers(headers)
+    local fields = normalize_http_headers(headers)
+    if #fields == 0 then
+        return false
+    end
+    if state.saved_http_headers == nil then
+        state.saved_http_headers = mp.get_property_native("http-header-fields")
+    end
+    mp.set_property_native("http-header-fields", fields)
+    state.http_headers_applied = true
+    return true
+end
+
+local function restore_http_headers()
+    if not state.http_headers_applied then
+        return
+    end
+    if state.saved_http_headers ~= nil then
+        mp.set_property_native("http-header-fields", state.saved_http_headers)
+    else
+        mp.set_property_native("http-header-fields", {})
+    end
+    state.saved_http_headers = nil
+    state.http_headers_applied = false
+end
+
 local function download_danmaku_xml(url)
+    local cached = get_cached_danmaku(url)
+    if cached then
+        return cached, nil
+    end
     local xml, err = http_get(url)
     if not xml then return nil, err end
     if xml == "" then return nil, "empty response" end
@@ -261,6 +336,7 @@ local function download_danmaku_xml(url)
     local ok, werr = write_file(file_path, normalized)
     if not ok then return nil, werr end
     remember_temp_file(file_path)
+    remember_danmaku_url(url, file_path)
     return file_path, nil
 end
 
@@ -440,7 +516,77 @@ local function get_play_url(site, flag, play_id)
     return data, nil
 end
 
-local function extract_play_url(data)
+local function extract_play_variants(data)
+    local variants = {}
+    if not data then return variants end
+
+    if type(data.url) == "string" then
+        if data.url ~= "" then
+            variants[#variants + 1] = { title = "默认", url = data.url }
+        end
+        return variants
+    end
+
+    if type(data.url) == "table" then
+        local n = #data.url
+        local is_pair_list = n >= 2
+        if is_pair_list then
+            for i = 1, n, 2 do
+                if type(data.url[i]) ~= "string" or type(data.url[i + 1]) ~= "string" then
+                    is_pair_list = false
+                    break
+                end
+            end
+        end
+        if is_pair_list then
+            for i = 1, n, 2 do
+                local title = data.url[i]
+                local url = data.url[i + 1]
+                if url and url ~= "" then
+                    variants[#variants + 1] = { title = title or ("线路 " .. tostring((i + 1) / 2)), url = url }
+                end
+            end
+            return variants
+        end
+
+        for i, v in ipairs(data.url) do
+            if type(v) == "string" then
+                if v ~= "" then
+                    variants[#variants + 1] = { title = "线路 " .. tostring(i), url = v }
+                end
+            elseif type(v) == "table" then
+                local title = v[1] or v.title or ("线路 " .. tostring(i))
+                local url = v[2] or v.url
+                if type(url) == "string" and url ~= "" then
+                    variants[#variants + 1] = { title = tostring(title), url = url }
+                end
+            end
+        end
+    end
+
+    if #variants == 0 and type(data.urls) == "table" then
+        for i, v in ipairs(data.urls) do
+            if type(v) == "string" then
+                if v ~= "" then
+                    variants[#variants + 1] = { title = "线路 " .. tostring(i), url = v }
+                end
+            elseif type(v) == "table" then
+                local title = v[1] or v.title or ("线路 " .. tostring(i))
+                local url = v[2] or v.url
+                if type(url) == "string" and url ~= "" then
+                    variants[#variants + 1] = { title = tostring(title), url = url }
+                end
+            end
+        end
+    end
+
+    return variants
+end
+
+local function extract_play_url(data, variants)
+    if variants and #variants > 0 then
+        return variants[1].url
+    end
     if not data then return nil end
     if type(data.url) == "string" and data.url ~= "" then
         return data.url
@@ -454,6 +600,95 @@ local function extract_play_url(data)
         if type(first) == "table" then return first[2] or first[1] end
     end
     return nil
+end
+
+local function attach_danmaku(danmaku)
+    if not danmaku then return end
+    mp.add_timeout(0.5, function()
+        if type(danmaku) == "number" or (type(danmaku) == "string" and danmaku:match("^%d+$")) then
+            mp.commandv("script-message", "load-danmaku", "", "", tostring(danmaku))
+            return
+        end
+        if is_http_url(danmaku) then
+            -- CatPawOpen 返回 danmu-proxy URL，需先下载为本地 XML 再交给 uosc_danmaku
+            local file_path, derr = download_danmaku_xml(danmaku)
+            if file_path then
+                mp.commandv("script-message", "add-source-event", file_path)
+            else
+                show_message("下载弹幕失败: " .. (derr or "未知错误"), 3)
+                msg.error("catpaw-search: download danmaku failed: " .. (derr or "unknown error"))
+            end
+            return
+        end
+        if type(danmaku) == "string" then
+            local info = utils.file_info(danmaku)
+            if info and info.is_file then
+                mp.commandv("script-message", "add-source-event", danmaku)
+                return
+            end
+        end
+        mp.commandv("script-message", "load-danmaku", "", "", tostring(danmaku))
+    end)
+end
+
+local function show_play_variants()
+    local variants = state.last_play_variants
+    if not variants or #variants == 0 then
+        show_message("无可切换线路", 2)
+        return
+    end
+
+    if use_uosc() then
+        local items = {}
+        for i, v in ipairs(variants) do
+            items[#items + 1] = {
+                title = v.title or ("线路 " .. tostring(i)),
+                value = {
+                    "script-message-to", mp.get_script_name(), "catpaw-play-variant",
+                    tostring(i),
+                },
+            }
+        end
+        update_menu_uosc("catpaw_streams", "选择线路", items, "", nil, nil)
+    elseif input_loaded then
+        local items = {}
+        for i, v in ipairs(variants) do
+            items[#items + 1] = {
+                title = v.title or ("线路 " .. tostring(i)),
+                value = {
+                    "script-message-to", mp.get_script_name(), "catpaw-play-variant",
+                    tostring(i),
+                },
+            }
+        end
+        mp.osd_message("")
+        mp.add_timeout(0.1, function() open_menu_select(items, "选择线路") end)
+    else
+        show_message("需要 uosc 或 mp.input 支持", 3)
+    end
+end
+
+local function play_variant(index)
+    local variants = state.last_play_variants
+    local idx = tonumber(index or "")
+    if not variants or #variants == 0 then
+        show_message("无可切换线路", 2)
+        return
+    end
+    if not idx or not variants[idx] then
+        show_message("线路不存在", 2)
+        return
+    end
+    local url = variants[idx].url
+    if not url or url == "" then
+        show_message("无可用播放地址", 2)
+        return
+    end
+    apply_http_headers(state.last_play_headers)
+    state.pending_danmaku = state.last_play_danmaku
+    state.pending_attach = true
+    state.switching_stream = true
+    mp.commandv("loadfile", url, "replace")
 end
 
 -- 业务逻辑
@@ -631,44 +866,22 @@ local function play_episode(site_id, flag, play_id)
         show_message("获取播放地址失败: " .. (err or "未知错误"), 3)
         return
     end
+    local variants = extract_play_variants(data)
+    state.last_play_variants = variants
+    state.last_play_danmaku = data.extra and data.extra.danmaku or nil
+    state.last_play_headers = data.header
 
-    local url = extract_play_url(data)
+    local url = extract_play_url(data, variants)
     if not url or url == "" then
         show_message("无可用播放地址", 3)
         return
     end
 
+    apply_http_headers(state.last_play_headers)
+    state.pending_danmaku = state.last_play_danmaku
+    state.pending_attach = true
+    state.switching_stream = true
     mp.commandv("loadfile", url, "replace")
-
-    -- 弹幕挂载
-    if data.extra and data.extra.danmaku then
-        local danmaku = data.extra.danmaku
-        mp.add_timeout(0.5, function()
-            if type(danmaku) == "number" or (type(danmaku) == "string" and danmaku:match("^%d+$")) then
-                mp.commandv("script-message", "load-danmaku", "", "", tostring(danmaku))
-                return
-            end
-            if is_http_url(danmaku) then
-                -- CatPawOpen 返回 danmu-proxy URL，需先下载为本地 XML 再交给 uosc_danmaku
-                local file_path, derr = download_danmaku_xml(danmaku)
-                if file_path then
-                    mp.commandv("script-message", "add-source-event", file_path)
-                else
-                    show_message("下载弹幕失败: " .. (derr or "未知错误"), 3)
-                    msg.error("catpaw-search: download danmaku failed: " .. (derr or "unknown error"))
-                end
-                return
-            end
-            if type(danmaku) == "string" then
-                local info = utils.file_info(danmaku)
-                if info and info.is_file then
-                    mp.commandv("script-message", "add-source-event", danmaku)
-                    return
-                end
-            end
-            mp.commandv("script-message", "load-danmaku", "", "", tostring(danmaku))
-        end)
-    end
 end
 
 local function do_search(keyword)
@@ -759,14 +972,48 @@ mp.register_script_message("catpaw-play-episode", function(site_id, flag, play_i
     play_episode(site_id, flag, play_id)
 end)
 
+mp.register_script_message("catpaw-show-streams", function()
+    show_play_variants()
+end)
+
+mp.register_script_message("catpaw-play-variant", function(index)
+    play_variant(index)
+end)
+
 mp.register_script_message("catpaw-show-results", function()
     show_cached_results()
 end)
 
 mp.register_event("end-file", function()
     cleanup_temp_files("end-file")
+    if not state.switching_stream then
+        state.last_play_variants = nil
+        state.last_play_danmaku = nil
+        state.last_play_headers = nil
+        state.pending_danmaku = nil
+        state.pending_attach = false
+        restore_http_headers()
+    end
+end)
+
+mp.register_event("file-loaded", function()
+    if not state.pending_attach then
+        return
+    end
+    local danmaku = state.pending_danmaku
+    state.pending_danmaku = nil
+    state.pending_attach = false
+    state.switching_stream = false
+    attach_danmaku(danmaku)
 end)
 
 mp.register_event("shutdown", function()
     cleanup_temp_files("shutdown")
+    state.last_play_variants = nil
+    state.last_play_danmaku = nil
+    state.last_play_headers = nil
+    state.pending_danmaku = nil
+    state.pending_attach = false
+    state.switching_stream = false
+    restore_http_headers()
 end)
