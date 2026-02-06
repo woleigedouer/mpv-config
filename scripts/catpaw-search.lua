@@ -1,5 +1,5 @@
 -- catpaw-search.lua
--- CatPawOpen 视频搜索与播放插件
+-- CatPawOpen 视频搜索、分类浏览与播放插件
 -- 支持 uosc 菜单（优先）和 mp.input 降级
 
 local mp = require 'mp'
@@ -38,6 +38,8 @@ local state = {
     episode_cache_key = nil,
     last_episode_ctx = nil,
     last_variant_title = nil,
+    browse_site_home = {},
+    browse_context = nil,
 }
 
 local detail_cache = {}
@@ -82,6 +84,24 @@ end
 
 local function trim(s)
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function normalize_text(text)
+    if text == nil then return "" end
+    local s = tostring(text)
+    s = s:gsub("[\r\n\t]+", " ")
+    s = s:gsub("%s+", " ")
+    return trim(s)
+end
+
+local function pick_first_text(...)
+    for i = 1, select("#", ...) do
+        local text = normalize_text(select(i, ...))
+        if text ~= "" then
+            return text
+        end
+    end
+    return ""
 end
 
 local function build_episode_cache(vod)
@@ -571,28 +591,62 @@ local function search_all_sites(keyword, done)
     end
 end
 
+local function post_site_api(site, action, payload)
+    local url = join_url(site.api .. "/" .. action)
+    local body = utils.format_json(payload or {})
+    local out, err = http_post(url, body)
+    if not out then return nil, err end
+    local data = parse_json(out)
+    if not data then return nil, "invalid /" .. action .. " response" end
+    return data, nil
+end
+
+local function get_home(site)
+    if state.browse_site_home[site.id] then
+        return state.browse_site_home[site.id], nil
+    end
+    local data, err = post_site_api(site, "home", {})
+    if not data then return nil, err end
+    state.browse_site_home[site.id] = data
+    return data, nil
+end
+
+local function get_category(site, type_id, page)
+    local payload = {
+        id = type_id,
+        page = tonumber(page) or 1,
+        filter = true,
+        filters = {},
+    }
+    local data, err = post_site_api(site, "category", payload)
+    if not data then return nil, err end
+    if type(data.list) ~= "table" then
+        data.list = {}
+    end
+    local current_page = tonumber(data.page) or payload.page
+    local total_page = tonumber(data.pagecount) or current_page
+    if total_page < current_page then
+        total_page = current_page
+    end
+    data.page = current_page
+    data.pagecount = total_page
+    return data, nil
+end
+
 local function get_detail(site, vod_id)
     local cache_key = site.id .. ":" .. tostring(vod_id)
     if detail_cache[cache_key] then
         return detail_cache[cache_key], nil
     end
-    local url = join_url(site.api .. "/detail")
-    local body = utils.format_json({ id = vod_id })
-    local out, err = http_post(url, body)
-    if not out then return nil, err end
-    local data = parse_json(out)
-    if not data then return nil, "invalid /detail response" end
+    local data, err = post_site_api(site, "detail", { id = vod_id })
+    if not data then return nil, err end
     detail_cache[cache_key] = data
     return data, nil
 end
 
 local function get_play_url(site, flag, play_id)
-    local url = join_url(site.api .. "/play")
-    local body = utils.format_json({ id = play_id, flag = flag })
-    local out, err = http_post(url, body)
-    if not out then return nil, err end
-    local data = parse_json(out)
-    if not data then return nil, "invalid /play response" end
+    local data, err = post_site_api(site, "play", { id = play_id, flag = flag })
+    if not data then return nil, err end
     return data, nil
 end
 
@@ -773,6 +827,118 @@ local function play_variant(index)
 end
 
 -- 业务逻辑
+local function ensure_service_ready()
+    local ok, err = check_service()
+    if ok == true then
+        return true
+    end
+    if err == CURL_NOT_FOUND then
+        show_message(CURL_NOT_FOUND, 3)
+    else
+        show_message("CatPawOpen 服务未运行", 3)
+    end
+    if err then
+        msg.error("catpaw-search: /check failed: " .. err)
+    end
+    return false
+end
+
+local function get_site_by_id(site_id)
+    if site_id and state.sites_by_id[site_id] then
+        return state.sites_by_id[site_id], nil
+    end
+    local _, err = get_sites()
+    if err then return nil, err end
+    return state.sites_by_id[site_id], nil
+end
+
+local function get_class_name(home, type_id)
+    if type(home) ~= "table" or type(home.class) ~= "table" then
+        return tostring(type_id or "")
+    end
+    for _, entry in ipairs(home.class) do
+        if tostring(entry.type_id or "") == tostring(type_id or "") then
+            return pick_first_text(entry.type_name, entry.type_id, type_id)
+        end
+    end
+    return tostring(type_id or "")
+end
+
+local function get_class_display_name(class_entry)
+    if type(class_entry) ~= "table" then
+        return "未命名分类"
+    end
+    return pick_first_text(class_entry.type_name, class_entry.type_id, "未命名分类")
+end
+
+local function find_class_index(classes, type_id)
+    if type(classes) ~= "table" then return nil end
+    local target = tostring(type_id or "")
+    for i, class_entry in ipairs(classes) do
+        if tostring(class_entry.type_id or "") == target then
+            return i
+        end
+    end
+    return nil
+end
+
+local function get_class_by_offset(classes, current_type_id, offset)
+    if type(classes) ~= "table" or #classes == 0 then
+        return nil
+    end
+    local current_idx = find_class_index(classes, current_type_id) or 1
+    local target = current_idx + (tonumber(offset) or 0)
+    while target < 1 do target = target + #classes end
+    while target > #classes do target = target - #classes end
+    return classes[target]
+end
+
+local function build_class_tab_line(classes, current_type_id, max_visible)
+    if type(classes) ~= "table" or #classes == 0 then
+        return ""
+    end
+    local current_idx = find_class_index(classes, current_type_id) or 1
+    local visible = tonumber(max_visible) or 6
+    if visible < 3 then visible = 3 end
+    if visible > #classes then visible = #classes end
+
+    local start_idx = current_idx - math.floor(visible / 2)
+    if start_idx < 1 then start_idx = 1 end
+    local end_idx = start_idx + visible - 1
+    if end_idx > #classes then
+        end_idx = #classes
+        start_idx = math.max(1, end_idx - visible + 1)
+    end
+
+    local parts = {}
+    if start_idx > 1 then
+        parts[#parts + 1] = "..."
+    end
+    for i = start_idx, end_idx do
+        local class_entry = classes[i]
+        local name = get_class_display_name(class_entry)
+        local class_id = tostring(class_entry.type_id or "")
+        if class_id == tostring(current_type_id or "") then
+            parts[#parts + 1] = "[" .. name .. "]"
+        else
+            parts[#parts + 1] = name
+        end
+    end
+    if end_idx < #classes then
+        parts[#parts + 1] = "..."
+    end
+    return table.concat(parts, "  ")
+end
+
+local function make_menu_label(vod)
+    local title = pick_first_text(vod.vod_name, vod.vod_id, "未知")
+    local hint = pick_first_text(vod.vod_remarks, vod.vod_year, vod.type_name)
+    if hint ~= "" then
+        return title, hint
+    end
+    return title, nil
+end
+
 local function show_search_results(results, errors)
     state.last_results = results
 
@@ -845,6 +1011,261 @@ local function show_search_results(results, errors)
     end
 end
 
+local function open_browser_hub()
+    if not ensure_service_ready() then return end
+    local sites, err = get_sites()
+    if not sites then
+        show_message("获取站点失败: " .. (err or "未知错误"), 3)
+        return
+    end
+
+    local script_name = mp.get_script_name()
+    local query_hint = state.last_query ~= "" and ("上次: " .. state.last_query) or "输入关键词后搜索"
+    local items = {}
+    items[#items + 1] = {
+        title = "搜索",
+        hint = query_hint,
+        value = { "script-message-to", script_name, "catpaw-open-search-input", state.last_query or "" },
+    }
+    for _, site in ipairs(sites) do
+        items[#items + 1] = {
+            title = site.name or site.id,
+            value = { "script-message-to", script_name, "catpaw-browse-site", site.id },
+        }
+    end
+    if #sites == 0 then
+        items[#items + 1] = {
+            title = "无可用站点",
+            italic = true,
+            selectable = false,
+            keep_open = true,
+        }
+    end
+
+    local menu_title = "CatPaw"
+    local footnote = #sites > 0 and ("站点: " .. tostring(#sites)) or ""
+    if use_uosc() then
+        update_menu_uosc("catpaw_home", menu_title, items, footnote, nil, nil)
+    elseif input_loaded then
+        mp.osd_message("")
+        mp.add_timeout(0.1, function() open_menu_select(items, menu_title) end)
+    else
+        show_message("需要 uosc 或 mp.input 支持", 3)
+    end
+end
+
+local function show_browse_sites()
+    open_browser_hub()
+end
+
+local show_category_page
+
+local function show_site_categories(site_id)
+    if not ensure_service_ready() then return end
+    local site, err = get_site_by_id(site_id)
+    if not site then
+        show_message("站点未找到: " .. tostring(site_id or ""), 3)
+        if err then msg.error("catpaw-search: get site failed: " .. err) end
+        return
+    end
+
+    local home, home_err = get_home(site)
+    if not home then
+        show_message("分类获取失败: " .. (home_err or "未知错误"), 3)
+        return
+    end
+
+    local classes = home.class
+    if type(classes) ~= "table" or #classes == 0 then
+        show_message("该站点暂无分类列表", 3)
+        return
+    end
+
+    local target_type_id = nil
+    local target_page = 1
+    if state.browse_context and state.browse_context.site_id == site.id and state.browse_context.type_id ~= "" then
+        target_type_id = state.browse_context.type_id
+        target_page = tonumber(state.browse_context.page) or 1
+    else
+        local first_class = classes[1]
+        target_type_id = first_class and tostring(first_class.type_id or "") or ""
+        target_page = 1
+    end
+
+    if target_type_id == "" then
+        show_message("分类数据无效", 3)
+        return
+    end
+
+    show_category_page(site.id, target_type_id, target_page)
+end
+
+local function browse_switch_class(offset)
+    local ctx = state.browse_context
+    if not ctx or not ctx.site_id or not ctx.type_id then
+        show_message("当前不在分类浏览页", 2)
+        return
+    end
+
+    local site, err = get_site_by_id(ctx.site_id)
+    if not site then
+        show_message("站点未找到", 2)
+        if err then msg.error("catpaw-search: get site failed: " .. err) end
+        return
+    end
+
+    local home, home_err = get_home(site)
+    if not home or type(home.class) ~= "table" or #home.class == 0 then
+        show_message("分类数据不可用", 2)
+        if home_err then msg.error("catpaw-search: get home failed: " .. home_err) end
+        return
+    end
+
+    local target = get_class_by_offset(home.class, ctx.type_id, offset)
+    if not target then
+        show_message("无法切换分类", 2)
+        return
+    end
+
+    local target_id = tostring(target.type_id or "")
+    if target_id == "" then
+        show_message("目标分类无效", 2)
+        return
+    end
+
+    show_category_page(site.id, target_id, 1)
+end
+
+show_category_page = function(site_id, type_id, page)
+    if not ensure_service_ready() then return end
+    local site, err = get_site_by_id(site_id)
+    if not site then
+        show_message("站点未找到: " .. tostring(site_id or ""), 3)
+        if err then msg.error("catpaw-search: get site failed: " .. err) end
+        return
+    end
+
+    local target_page = tonumber(page) or 1
+    if target_page < 1 then target_page = 1 end
+
+    local category, cat_err = get_category(site, type_id, target_page)
+    if not category then
+        show_message("分类列表获取失败: " .. (cat_err or "未知错误"), 3)
+        return
+    end
+
+    local home = state.browse_site_home[site.id]
+    if type(home) ~= "table" then
+        local fetched_home = nil
+        fetched_home, _ = get_home(site)
+        home = fetched_home
+    end
+    local classes = (type(home) == "table" and type(home.class) == "table") and home.class or {}
+    local class_name = get_class_name(home, type_id)
+    state.browse_context = {
+        site_id = site.id,
+        type_id = tostring(type_id or ""),
+        page = category.page,
+        pagecount = category.pagecount,
+        class_name = class_name,
+    }
+
+    local script_name = mp.get_script_name()
+    local items = {}
+    items[#items + 1] = {
+        title = "返回菜单",
+        value = { "script-message-to", script_name, "catpaw-open-browser" },
+    }
+    if #classes > 0 then
+        local tab_line = build_class_tab_line(classes, type_id, 6)
+        if tab_line ~= "" then
+            items[#items + 1] = {
+                title = tab_line,
+                italic = true,
+                selectable = false,
+                keep_open = true,
+                align = "center",
+            }
+        end
+        local prev_class = get_class_by_offset(classes, type_id, -1)
+        local next_class = get_class_by_offset(classes, type_id, 1)
+        items[#items + 1] = {
+            title = "上一分类",
+            hint = prev_class and get_class_display_name(prev_class) or nil,
+            value = { "script-message-to", script_name, "catpaw-browse-prev-class" },
+        }
+        items[#items + 1] = {
+            title = "下一分类",
+            hint = next_class and get_class_display_name(next_class) or nil,
+            value = { "script-message-to", script_name, "catpaw-browse-next-class" },
+        }
+    end
+    if category.page > 1 then
+        items[#items + 1] = {
+            title = "上一页",
+            value = {
+                "script-message-to", script_name, "catpaw-browse-category",
+                site.id, tostring(type_id or ""), tostring(category.page - 1),
+            },
+        }
+    end
+    if category.page < category.pagecount then
+        items[#items + 1] = {
+            title = "下一页",
+            value = {
+                "script-message-to", script_name, "catpaw-browse-category",
+                site.id, tostring(type_id or ""), tostring(category.page + 1),
+            },
+        }
+    end
+
+    local videos = category.list or {}
+    if #videos == 0 then
+        items[#items + 1] = {
+            title = "该页暂无内容",
+            italic = true,
+            selectable = false,
+            keep_open = true,
+        }
+    else
+        local added = 0
+        for _, vod in ipairs(videos) do
+            local vod_id = pick_first_text(vod.vod_id, vod.book_id, vod.id)
+            if vod_id ~= "" then
+                local title, hint = make_menu_label(vod)
+                items[#items + 1] = {
+                    title = title,
+                    hint = hint,
+                    value = {
+                        "script-message-to", script_name, "catpaw-show-detail",
+                        site.id, vod_id, "browse", tostring(type_id or ""), tostring(category.page),
+                    },
+                }
+                added = added + 1
+            end
+        end
+        if added == 0 then
+            items[#items + 1] = {
+                title = "未找到可播放条目",
+                italic = true,
+                selectable = false,
+                keep_open = true,
+            }
+        end
+    end
+
+    local menu_title = string.format("%s · %s", site.name or site.id, class_name)
+    local footnote = string.format("第 %d / %d 页 · Tab 切换: 上一分类/下一分类", category.page, category.pagecount)
+    if use_uosc() then
+        update_menu_uosc("catpaw_category", menu_title, items, footnote, nil, nil)
+    elseif input_loaded then
+        mp.osd_message("")
+        mp.add_timeout(0.1, function() open_menu_select(items, menu_title) end)
+    else
+        show_message("需要 uosc 或 mp.input 支持", 3)
+    end
+end
+
 local function build_episode_menu_items(cache, site_id)
     local items = {}
     if not cache or not cache.lines then return items end
@@ -884,6 +1305,26 @@ local function build_episode_flat_items(cache, site_id)
                 },
             }
         end
+    end
+    return items
+end
+
+local function build_detail_menu_items(cache, site_id, browse_context)
+    local items = {}
+    if browse_context and browse_context.site_id and browse_context.type_id and browse_context.type_id ~= "" then
+        items[#items + 1] = {
+            title = "返回分类列表",
+            value = {
+                "script-message-to", mp.get_script_name(), "catpaw-browse-category",
+                browse_context.site_id,
+                browse_context.type_id,
+                tostring(browse_context.page or 1),
+            },
+        }
+    end
+    local episode_groups = build_episode_menu_items(cache, site_id)
+    for _, group in ipairs(episode_groups) do
+        items[#items + 1] = group
     end
     return items
 end
@@ -992,10 +1433,11 @@ local function play_prev_episode()
     play_episode(ctx.site_id, ctx.line, ctx.play_id)
 end
 
-local function show_detail(site_id, vod_id)
-    local site = state.sites_by_id[site_id]
+local function show_detail(site_id, vod_id, source, type_id, page)
+    local site, site_err = get_site_by_id(site_id)
     if not site then
         show_message("站点未找到", 3)
+        if site_err then msg.error("catpaw-search: get site failed: " .. site_err) end
         return
     end
 
@@ -1011,16 +1453,49 @@ local function show_detail(site_id, vod_id)
         return
     end
 
-    state.current_detail = { site = site, vod = vod, vod_id = vod_id }
+    local browse_context = nil
+    if source == "browse" then
+        local browse_type_id = tostring(type_id or "")
+        if browse_type_id ~= "" then
+            browse_context = {
+                site_id = site.id,
+                type_id = browse_type_id,
+                page = tonumber(page) or 1,
+            }
+            state.browse_context = browse_context
+        end
+    end
+
+    state.current_detail = {
+        site = site,
+        vod = vod,
+        vod_id = vod_id,
+        browse_context = browse_context,
+    }
 
     local cache = set_episode_cache(site.id, vod_id, vod)
     local title = vod.vod_name or "详情"
 
     if use_uosc() then
-        local items = build_episode_menu_items(cache, site.id)
+        local items = build_detail_menu_items(cache, site.id, browse_context)
         update_menu_uosc("catpaw_detail", title, items, "", nil, nil)
     elseif input_loaded then
-        local items = build_episode_flat_items(cache, site.id)
+        local items = {}
+        if browse_context and browse_context.site_id and browse_context.type_id and browse_context.type_id ~= "" then
+            items[#items + 1] = {
+                title = "返回分类列表",
+                value = {
+                    "script-message-to", mp.get_script_name(), "catpaw-browse-category",
+                    browse_context.site_id,
+                    browse_context.type_id,
+                    tostring(browse_context.page or 1),
+                },
+            }
+        end
+        local episode_items = build_episode_flat_items(cache, site.id)
+        for _, item in ipairs(episode_items) do
+            items[#items + 1] = item
+        end
         mp.osd_message("")
         mp.add_timeout(0.1, function() open_menu_select(items, "选择剧集") end)
     else
@@ -1029,9 +1504,10 @@ local function show_detail(site_id, vod_id)
 end
 
 play_episode = function(site_id, flag, play_id)
-    local site = state.sites_by_id[site_id]
+    local site, site_err = get_site_by_id(site_id)
     if not site then
         show_message("站点未找到", 3)
+        if site_err then msg.error("catpaw-search: get site failed: " .. site_err) end
         return
     end
 
@@ -1090,14 +1566,7 @@ local function do_search(keyword)
 
     state.last_query = keyword
 
-    local ok, err = check_service()
-    if ok ~= true then
-        if err == CURL_NOT_FOUND then
-            show_message(CURL_NOT_FOUND, 3)
-        else
-            show_message("CatPawOpen 服务未运行", 3)
-        end
-        if err then msg.error("catpaw-search: /check failed: " .. err) end
+    if not ensure_service_ready() then
         return
     end
 
@@ -1155,15 +1624,43 @@ mp.register_script_message("uosc-version", function()
 end)
 
 mp.register_script_message("catpaw-open-search", function(query)
+    open_browser_hub()
+end)
+
+mp.register_script_message("catpaw-open-search-input", function(query)
     open_search(query)
+end)
+
+mp.register_script_message("catpaw-open-browser", function()
+    open_browser_hub()
 end)
 
 mp.register_script_message("catpaw-do-search", function(query)
     do_search(query)
 end)
 
-mp.register_script_message("catpaw-show-detail", function(site_id, vod_id)
-    show_detail(site_id, vod_id)
+mp.register_script_message("catpaw-browse-sites", function()
+    show_browse_sites()
+end)
+
+mp.register_script_message("catpaw-browse-site", function(site_id)
+    show_site_categories(site_id)
+end)
+
+mp.register_script_message("catpaw-browse-category", function(site_id, type_id, page)
+    show_category_page(site_id, type_id, page)
+end)
+
+mp.register_script_message("catpaw-browse-prev-class", function()
+    browse_switch_class(-1)
+end)
+
+mp.register_script_message("catpaw-browse-next-class", function()
+    browse_switch_class(1)
+end)
+
+mp.register_script_message("catpaw-show-detail", function(site_id, vod_id, source, type_id, page)
+    show_detail(site_id, vod_id, source, type_id, page)
 end)
 
 mp.register_script_message("catpaw-play-episode", function(site_id, flag, play_id)
@@ -1240,5 +1737,7 @@ mp.register_event("shutdown", function()
     state.episode_cache = nil
     state.episode_cache_key = nil
     state.last_episode_ctx = nil
+    state.browse_site_home = {}
+    state.browse_context = nil
     restore_http_headers()
 end)
