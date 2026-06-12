@@ -25,14 +25,13 @@ function set_episode_id(input, from_menu, api_server)
     from_menu = from_menu or false
     DANMAKU.source = "dandanplay"
     local selected_server = api_server
-    for url, source in pairs(DANMAKU.sources) do
-        if source.from == "api_server" then
-            if not source.from_history then
-                DANMAKU.sources[url] = nil
-            else
-                DANMAKU.sources[url]["data"] = nil
-            end
-        end
+    DANMAKU.sources = {}
+    COMMENTS = {}
+    if DANMAKU_COUNT then
+        mp.set_property_native(DANMAKU_COUNT, 0)
+    end
+    if render then
+        render()
     end
 
     if not api_server then
