@@ -437,14 +437,25 @@ function open_input_menu_get()
     })
 end
 
+local function format_linked_danmaku_title()
+    if DANMAKU.anime and DANMAKU.episode then
+        local episode = tostring(DANMAKU.episode):gsub("^%s+", ""):gsub("%s+$", "")
+        local count = get_danmaku_display_count and get_danmaku_display_count()
+        if count == nil then
+            count = 0
+        end
+        return string.format("已关联弹幕：%s - %s - %d条", DANMAKU.anime, episode, count)
+    end
+    return nil
+end
+
 function open_input_menu_uosc()
     local items = {}
 
-    if DANMAKU.anime and DANMAKU.episode then
-        local episode = DANMAKU.episode:gsub("%s.-$","")
-        episode = episode:match("^(第.*[话回集]+)%s*") or episode
+    local linked_title = format_linked_danmaku_title()
+    if linked_title then
         items[#items + 1] = {
-            title = string.format("已关联弹幕：%s-%s", DANMAKU.anime, episode),
+            title = linked_title,
             bold = true,
             italic = true,
             keep_open = true,
@@ -1202,11 +1213,10 @@ local total_menu_items_config = {
 function open_add_total_menu_uosc()
     local items = {}
 
-    if DANMAKU.anime and DANMAKU.episode then
-        local episode = DANMAKU.episode:gsub("%s.-$","")
-        episode = episode:match("^(第.*[话回集]+)%s*") or episode
+    local linked_title = format_linked_danmaku_title()
+    if linked_title then
         items[#items + 1] = {
-            title = string.format("已关联弹幕：%s-%s", DANMAKU.anime, episode),
+            title = linked_title,
             bold = true,
             italic = true,
             keep_open = true,
@@ -1383,6 +1393,11 @@ mp.register_script_message("load-danmaku", function(animeTitle, episodeTitle, ep
     DANMAKU.anime = animeTitle
     DANMAKU.episode = episodeTitle
     set_episode_id(episodeId, true, api_server)
+end)
+
+mp.register_script_message("load-danmaku-url", function(url)
+    ENABLED = true
+    load_danmaku_url(url, true)
 end)
 
 mp.register_script_message("add-source-event", function(query)

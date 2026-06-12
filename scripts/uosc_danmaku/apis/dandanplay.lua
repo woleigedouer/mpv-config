@@ -26,6 +26,7 @@ function set_episode_id(input, from_menu, api_server)
     DANMAKU.source = "dandanplay"
     local selected_server = api_server
     DANMAKU.sources = {}
+    DANMAKU.comment_count = nil
     COMMENTS = {}
     if DANMAKU_COUNT then
         mp.set_property_native(DANMAKU_COUNT, 0)
@@ -491,16 +492,66 @@ function handle_fetched_danmaku(data, url, from_menu)
             if DANMAKU.sources[url] == nil then
                 DANMAKU.sources[url] = {from = "api_server"}
             end
+            DANMAKU.comment_count = 0
             show_message("该集弹幕内容为空，结束加载", 3)
             msg.verbose("该集弹幕内容为空，结束加载")
             return
         end
+        DANMAKU.comment_count = tonumber(data["count"]) or #(data["comments"])
         save_danmaku_data(data["comments"], url, "api_server")
         load_danmaku(from_menu)
     else
         show_message("无数据", 3)
         msg.info("无数据")
     end
+end
+
+function load_danmaku_url(url, from_menu)
+    if not url or url == "" then
+        show_message("弹幕地址为空", 3)
+        return
+    end
+
+    from_menu = from_menu or false
+    set_danmaku_button()
+    show_message("弹幕加载中...", 30)
+    msg.verbose("尝试获取弹幕：" .. url)
+
+    local args = make_danmaku_request_args("GET", url)
+    if args == nil then
+        return
+    end
+
+    fetch_danmaku_data(args, function(data)
+        local comments = data and data["comments"]
+        if type(comments) ~= "table" or #comments == 0 then
+            show_message("无数据", 3)
+            msg.info("无数据")
+            return
+        end
+
+        local match = type(data["match"]) == "table" and data["match"] or {}
+        local anime_title = match["animeTitle"] or match["anime_title"] or match["title"]
+        local episode_title = match["episodeTitle"] or match["episode_title"] or match["episode"]
+        local source_name = match["sourceName"] or match["source_name"]
+
+        if anime_title and tostring(anime_title) ~= "" then
+            DANMAKU.anime = tostring(anime_title)
+        end
+        if episode_title and tostring(episode_title) ~= "" then
+            DANMAKU.episode = tostring(episode_title)
+        end
+        if source_name and tostring(source_name) ~= "" then
+            DANMAKU.source = tostring(source_name)
+        end
+        DANMAKU.comment_count = tonumber(data["count"]) or #comments
+
+        save_danmaku_data(comments, url, "user_custom")
+        if from_menu and add_source_to_history and DANMAKU.sources[url] then
+            add_source_to_history(url, DANMAKU.sources[url])
+        end
+        load_danmaku(from_menu)
+    end)
 end
 
 -- 匹配弹幕库 comment, 仅匹配dandan本身弹幕库
@@ -642,7 +693,7 @@ function save_danmaku_to_list(comments)
     for _, comment in ipairs(comments) do
         local p = comment["p"]
         local shift = comment["shift"]
-        if p then
+        if p and comment["m"] ~= nil then
             local fields = split(p, ",")
             if shift ~= nil then
                 fields[1] = tonumber(fields[1]) + tonumber(shift)
@@ -651,7 +702,7 @@ function save_danmaku_to_list(comments)
             local type = tonumber(fields[2])
             local color = tonumber(fields[3]) or 0xFFFFFF
             local size = 25
-            local m_value = comment["m"]
+            local m_value = tostring(comment["m"])
                             :gsub("[%z\1-\31]", "")
                             :gsub("\\", "")
                             :gsub("\"", "")

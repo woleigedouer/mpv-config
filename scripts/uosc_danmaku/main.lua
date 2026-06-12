@@ -107,16 +107,36 @@ function set_danmaku_button()
     end
 end
 
+function get_danmaku_display_count()
+    local count = tonumber(DANMAKU.comment_count)
+    if count ~= nil then return count end
+
+    local source_count = 0
+    local has_source = false
+    if type(DANMAKU.sources) == "table" then
+        for _, source in pairs(DANMAKU.sources) do
+            if source and source.data and not source.blocked then
+                has_source = true
+                source_count = source_count + #source.data
+            end
+        end
+    end
+    if has_source then return source_count end
+
+    return type(COMMENTS) == "table" and #COMMENTS or 0
+end
+
 function show_loaded(init)
+    local count = get_danmaku_display_count()
     if DANMAKU.anime and DANMAKU.episode then
-        show_message("匹配内容：" .. DANMAKU.anime .. "-" .. DANMAKU.episode .. "\\N弹幕加载成功，共计" .. #COMMENTS .. "条弹幕", 3)
+        show_message("匹配内容：" .. DANMAKU.anime .. "-" .. DANMAKU.episode .. "\\N弹幕加载成功，共计" .. count .. "条弹幕", 3)
         if init then
-            msg.info(DANMAKU.anime .. "-" .. DANMAKU.episode .. " 弹幕加载成功，共计" .. #COMMENTS .. "条弹幕")
+            msg.info(DANMAKU.anime .. "-" .. DANMAKU.episode .. " 弹幕加载成功，共计" .. count .. "条弹幕")
         end
     else
-        show_message("弹幕加载成功，共计" .. #COMMENTS .. "条弹幕", 3)
+        show_message("弹幕加载成功，共计" .. count .. "条弹幕", 3)
     end
-    mp.set_property_native(DANMAKU_COUNT, #COMMENTS)
+    mp.set_property_native(DANMAKU_COUNT, count)
 end
 
 -- 获取指定时间的延迟

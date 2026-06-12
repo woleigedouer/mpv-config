@@ -419,6 +419,17 @@ local function is_http_url(text)
     return type(text) == "string" and text:match("^https?://")
 end
 
+local function is_catpaw_danmaku_proxy(url)
+    return is_http_url(url) and url:find("/danmu-proxy", 1, true) ~= nil
+end
+
+local function with_json_danmaku_format(url)
+    if url:find("[?&]format=", 1) then
+        return url
+    end
+    return url .. (url:find("?", 1, true) and "&" or "?") .. "format=json"
+end
+
 local function is_catpaw_playback()
     local path = mp.get_property("path") or ""
     return path ~= "" and path:sub(1, #base_url) == base_url
@@ -793,8 +804,11 @@ local function attach_danmaku(danmaku)
             mp.commandv("script-message", "load-danmaku", "", "", tostring(danmaku))
             return
         end
+        if is_catpaw_danmaku_proxy(danmaku) then
+            mp.commandv("script-message", "load-danmaku-url", with_json_danmaku_format(danmaku))
+            return
+        end
         if is_http_url(danmaku) then
-            -- CatPawOpen 返回 danmu-proxy URL，需先下载为本地 XML 再交给 uosc_danmaku
             local file_path, derr = download_danmaku_xml(danmaku)
             if file_path then
                 mp.commandv("script-message", "add-source-event", file_path)
