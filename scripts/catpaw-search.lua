@@ -32,6 +32,7 @@ local state = {
     pending_attach = false,
     switching_stream = false,
     last_play_headers = nil,
+    last_play_media_title = nil,
     saved_http_headers = nil,
     http_headers_applied = false,
     episode_cache = nil,
@@ -102,6 +103,55 @@ local function pick_first_text(...)
         end
     end
     return ""
+end
+
+local function get_current_vod_title()
+    local detail = state.current_detail
+    if type(detail) ~= "table" or type(detail.vod) ~= "table" then
+        return ""
+    end
+    local vod = detail.vod
+    return pick_first_text(vod.vod_name, vod.name, vod.title)
+end
+
+local function resolve_play_media_title(data)
+    local extra = type(data) == "table" and data.extra or nil
+    if type(extra) == "table" then
+        return pick_first_text(extra.mediaTitle, extra.media_title, extra.title, extra.name, get_current_vod_title())
+    end
+    return get_current_vod_title()
+end
+
+local function get_loadfile_options_arg_index()
+    local commands = mp.get_property_native("command-list", {})
+    for _, command in ipairs(commands) do
+        if command.name == "loadfile" then
+            for i, arg in ipairs(command.args or {}) do
+                if arg.name == "options" then
+                    return i
+                end
+            end
+        end
+    end
+    return 3
+end
+
+local loadfile_options_arg_index = get_loadfile_options_arg_index()
+
+local function loadfile_replace(url, title)
+    title = normalize_text(title)
+    if title ~= "" then
+        local opts = { ["force-media-title"] = title }
+        local args = loadfile_options_arg_index == 3
+            and { "loadfile", url, "replace", opts }
+            or { "loadfile", url, "replace", -1, opts }
+        local ok, result = pcall(mp.command_native, args)
+        if ok and result ~= nil then
+            return
+        end
+        msg.warn("catpaw-search: loadfile with media title failed, fallback to plain loadfile")
+    end
+    mp.commandv("loadfile", url, "replace")
 end
 
 local function build_episode_cache(vod)
@@ -823,7 +873,7 @@ local function play_variant(index)
     state.pending_danmaku = state.last_play_danmaku
     state.pending_attach = true
     state.switching_stream = true
-    mp.commandv("loadfile", url, "replace")
+    loadfile_replace(url, state.last_play_media_title)
 end
 
 -- 业务逻辑
@@ -1522,6 +1572,7 @@ play_episode = function(site_id, flag, play_id)
     state.last_play_variants = variants
     state.last_play_danmaku = data.extra and data.extra.danmaku or nil
     state.last_play_headers = data.header
+    state.last_play_media_title = resolve_play_media_title(data)
     update_last_episode_ctx(site_id, flag, play_id)
 
     local url = nil
@@ -1555,7 +1606,7 @@ play_episode = function(site_id, flag, play_id)
     state.pending_danmaku = state.last_play_danmaku
     state.pending_attach = true
     state.switching_stream = true
-    mp.commandv("loadfile", url, "replace")
+    loadfile_replace(url, state.last_play_media_title)
 end
 
 local function do_search(keyword)
@@ -1708,6 +1759,7 @@ mp.register_event("end-file", function(event)
         state.last_play_danmaku = nil
         state.last_play_headers = nil
         state.last_variant_title = nil
+        state.last_play_media_title = nil
         state.pending_danmaku = nil
         state.pending_attach = false
         restore_http_headers()
@@ -1731,6 +1783,7 @@ mp.register_event("shutdown", function()
     state.last_play_danmaku = nil
     state.last_play_headers = nil
     state.last_variant_title = nil
+    state.last_play_media_title = nil
     state.pending_danmaku = nil
     state.pending_attach = false
     state.switching_stream = false
